@@ -107,7 +107,7 @@ mount "$EFI_PART" /mnt/efi
 # Install base packages (added binutils for objcopy)
 PACKAGES=(base linux linux-headers linux-firmware btrfs-progs base-devel \
           vim nano git cryptsetup sbctl efibootmgr dosfstools os-prober \
-          sudo networkmanager systemd-boot binutils)
+          sudo networkmanager binutils)
 [[ -n "$MICROCODE" ]] && PACKAGES+=("$MICROCODE")
 case $GPU_CHOICE in
   1) PACKAGES+=(nvidia nvidia-utils nvidia-settings) ;;
