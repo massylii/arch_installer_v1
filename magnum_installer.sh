@@ -107,7 +107,7 @@ mount "$EFI_PART" /mnt/efi
 # Install base packages (added binutils for objcopy)
 PACKAGES=(base linux linux-headers linux-firmware btrfs-progs base-devel \
           vim nano git cryptsetup sbctl efibootmgr dosfstools os-prober \
-          sudo networkmanager binutils)
+          sudo networkmanager systemd-boot binutils)
 [[ -n "$MICROCODE" ]] && PACKAGES+=("$MICROCODE")
 case $GPU_CHOICE in
   1) PACKAGES+=(nvidia nvidia-utils nvidia-settings) ;;
@@ -130,6 +130,8 @@ set -euo pipefail
 IFS=$'\n\t'
 
 log(){ echo "[+] $*"; }
+warn(){ echo "[!] $*"; }
+error(){ echo "[ERROR] $*"; exit 1; }
 
 # Root password
 echo "[*] Set root password:"
@@ -174,68 +176,90 @@ if ! grep -q "^/swapfile" /etc/fstab; then
 fi
 
 # Secure Boot: create keys and enroll (you will confirm enrollment at boot)
-log "Creating and enrolling Secure Boot keys with sbctl"
-sbctl create-keys
-sbctl enroll-keys -m
+log "Creating Secure Boot keys with sbctl"
+if ! sbctl create-keys; then
+  warn "Failed to create Secure Boot keys, continuing without Secure Boot"
+  SECURE_BOOT=false
+else
+  SECURE_BOOT=true
+  log "Enrolling Secure Boot keys (manual mode - confirm at next boot)"
+  sbctl enroll-keys -m
+fi
 
 # Prepare kernel cmdline for UKI (systemd format)
 ROOT_UUID=$(blkid -s UUID -o value __ROOT_PART__)
 if [[ -z "$ROOT_UUID" ]]; then
-  echo "[ERROR] Could not get root UUID"; exit 1
+  error "Could not get root UUID"
 fi
 KERNEL_CMDLINE="rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw"
 
 # Determine microcode path if installed
 MICROCODE_PATH=""
-if [[ -n "$MICROCODE" && -f /boot/$MICROCODE-ucode.img ]]; then
-  MICROCODE_PATH="/boot/$MICROCODE-ucode.img"
-  log "Including microcode: $MICROCODE"
+if [[ -n "__MICROCODE__" && -f /boot/__MICROCODE__.img ]]; then
+  MICROCODE_PATH="/boot/__MICROCODE__.img"
+  log "Including microcode: __MICROCODE__"
 fi
 
 # Create UKI directory on ESP
 mkdir -p /efi/EFI/Linux
 
-# tmp cmdline
-echo "$KERNEL_CMDLINE" > /tmp/cmdline
+# Create combined initrd with microcode (proper method)
+create_combined_initrd() {
+  local output_file="$1"
+  local initrd_file="$2"
+  
+  rm -f "$output_file" 2>/dev/null || true
+  
+  if [[ -n "$MICROCODE_PATH" && -f "$MICROCODE_PATH" ]]; then
+    cat "$MICROCODE_PATH" "$initrd_file" > "$output_file"
+  else
+    cp "$initrd_file" "$output_file"
+  fi
+}
 
 # Build main UKI
 log "Building main UKI (/efi/EFI/Linux/arch.efi)"
-if [[ -n "$MICROCODE_PATH" && -f "$MICROCODE_PATH" ]]; then
-  cat "$MICROCODE_PATH" /boot/initramfs-linux.img > /tmp/combined-initrd.img
-  INITRD_PATH="/tmp/combined-initrd.img"
-else
-  INITRD_PATH="/boot/initramfs-linux.img"
-fi
+create_combined_initrd /tmp/combined-initrd.img /boot/initramfs-linux.img
 
 objcopy \
   --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
-  --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \
+  --add-section .cmdline=<(echo "$KERNEL_CMDLINE") --change-section-vma .cmdline=0x30000 \
   --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \
-  --add-section .initrd=$INITRD_PATH --change-section-vma .initrd=0x3000000 \
+  --add-section .initrd=/tmp/combined-initrd.img --change-section-vma .initrd=0x3000000 \
   /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch.efi
 
-# Build fallback UKI (if fallback exists or reuse main initrd)
-log "Building fallback UKI (/efi/EFI/Linux/arch-fallback.efi)"
-if [[ -n "$MICROCODE_PATH" && -f "$MICROCODE_PATH" && -f /boot/initramfs-linux-fallback.img ]]; then
-  cat "$MICROCODE_PATH" /boot/initramfs-linux-fallback.img > /tmp/combined-initrd-fallback.img
-  INITRD_FB="/tmp/combined-initrd-fallback.img"
-elif [[ -f /boot/initramfs-linux-fallback.img ]]; then
-  INITRD_FB="/boot/initramfs-linux-fallback.img"
-else
-  INITRD_FB="$INITRD_PATH"
+# Build fallback UKI if fallback initrd exists
+if [[ -f /boot/initramfs-linux-fallback.img ]]; then
+  log "Building fallback UKI (/efi/EFI/Linux/arch-fallback.efi)"
+  create_combined_initrd /tmp/combined-initrd-fallback.img /boot/initramfs-linux-fallback.img
+  
+  objcopy \
+    --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
+    --add-section .cmdline=<(echo "$KERNEL_CMDLINE") --change-section-vma .cmdline=0x30000 \
+    --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \
+    --add-section .initrd=/tmp/combined-initrd-fallback.img --change-section-vma .initrd=0x3000000 \
+    /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch-fallback.efi
 fi
 
-objcopy \
-  --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
-  --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \
-  --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \
-  --add-section .initrd=$INITRD_FB --change-section-vma .initrd=0x3000000 \
-  /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch-fallback.efi
-
-# Sign UKIs
-log "Signing UKIs"
-sbctl sign -s /efi/EFI/Linux/arch.efi
-sbctl sign -s /efi/EFI/Linux/arch-fallback.efi || true
+# Sign UKIs if Secure Boot is enabled
+if [[ "$SECURE_BOOT" == true ]]; then
+  log "Signing UKIs"
+  if sbctl sign -s /efi/EFI/Linux/arch.efi; then
+    log "Signed main UKI"
+  else
+    warn "Failed to sign main UKI"
+  fi
+  
+  if [[ -f /efi/EFI/Linux/arch-fallback.efi ]]; then
+    if sbctl sign -s /efi/EFI/Linux/arch-fallback.efi; then
+      log "Signed fallback UKI"
+    else
+      warn "Failed to sign fallback UKI"
+    fi
+  fi
+else
+  warn "UKIs not signed (Secure Boot disabled)"
+fi
 
 # Configure systemd-boot loader to point at UKI
 mkdir -p /efi/loader
@@ -246,8 +270,31 @@ console-mode max
 editor no
 LOADER
 
+# Create systemd-boot entry for UKI
+mkdir -p /efi/loader/entries
+cat > /efi/loader/entries/arch.conf <<ENTRY
+title Arch Linux
+efi /EFI/Linux/arch.efi
+options rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw
+ENTRY
+
+if [[ -f /efi/EFI/Linux/arch-fallback.efi ]]; then
+  cat > /efi/loader/entries/arch-fallback.conf <<ENTRY
+title Arch Linux (fallback)
+efi /EFI/Linux/arch-fallback.efi
+options rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw
+ENTRY
+fi
+
 # Clean temp files
-rm -f /tmp/cmdline /tmp/combined-initrd.img /tmp/combined-initrd-fallback.img || true
+rm -f /tmp/combined-initrd.img /tmp/combined-initrd-fallback.img 2>/dev/null || true
+
+# Verify UKI creation
+if [[ ! -f /efi/EFI/Linux/arch.efi ]]; then
+  error "Main UKI creation failed!"
+fi
+
+log "UKI created successfully: /efi/EFI/Linux/arch.efi"
 
 # Enable services
 systemctl enable NetworkManager
@@ -257,7 +304,8 @@ systemctl enable fstrim.timer
 echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
 chmod 0440 /etc/sudoers.d/wheel
 
-echo "[*] CHROOT STEP COMPLETE. Exit chroot, unmount and reboot when ready."
+log "CHROOT STEP COMPLETE. Exit chroot, unmount and reboot when ready."
+log "Note: You will need to confirm Secure Boot key enrollment at next boot if enabled."
 EOF
 
 # Replace placeholders in chroot script
