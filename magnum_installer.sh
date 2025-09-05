@@ -107,7 +107,7 @@ mount "$EFI_PART" /mnt/efi
 # Install base packages (added binutils for objcopy)
 PACKAGES=(base linux linux-headers linux-firmware btrfs-progs base-devel \
           vim nano git cryptsetup sbctl efibootmgr dosfstools os-prober \
-          sudo networkmanager systemd-boot binutils)
+          sudo networkmanager binutils)
 [[ -n "$MICROCODE" ]] && PACKAGES+=("$MICROCODE")
 case $GPU_CHOICE in
   1) PACKAGES+=(nvidia nvidia-utils nvidia-settings) ;;
@@ -185,11 +185,11 @@ if [[ -z "$ROOT_UUID" ]]; then
 fi
 KERNEL_CMDLINE="rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw"
 
-# Determine microcode path if installed (correct path: /boot/<microcode>.img)
+# Determine microcode path if installed
 MICROCODE_PATH=""
-if [[ -n "__MICROCODE__" && -f /boot/__MICROCODE__.img ]]; then
-  MICROCODE_PATH="/boot/__MICROCODE__.img"
-  log "Including microcode: __MICROCODE__"
+if [[ -n "$MICROCODE" && -f /boot/$MICROCODE-ucode.img ]]; then
+  MICROCODE_PATH="/boot/$MICROCODE-ucode.img"
+  log "Including microcode: $MICROCODE"
 fi
 
 # Create UKI directory on ESP
