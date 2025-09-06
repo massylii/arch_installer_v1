@@ -122,36 +122,36 @@ pacstrap /mnt "${PACKAGES[@]}"
 log "Generating fstab"
 genfstab -U /mnt > /mnt/etc/fstab
 
-# Create chroot script
-log "Writing /root/arch_chroot.sh (inside new system)"
-cat > /mnt/root/arch_chroot.sh <<'EOF'
+# Create chroot script with ACTUAL VALUES instead of placeholders
+log "Creating /root/arch_chroot.sh with actual values"
+cat > /mnt/root/arch_chroot.sh <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
 
-log(){ echo "[+] $*"; }
-warn(){ echo "[!] $*"; }
-error(){ echo "[ERROR] $*"; exit 1; }
+log(){ echo "[+] \$*"; }
+warn(){ echo "[!] \$*"; }
+error(){ echo "[ERROR] \$*"; exit 1; }
 
 # Root password
 echo "[*] Set root password:"
 passwd
 
 # Create user
-useradd -m -G wheel -s /bin/bash __USERNAME__
-echo "[*] Set password for __USERNAME__:"
-passwd __USERNAME__
+useradd -m -G wheel -s /bin/bash $USERNAME
+echo "[*] Set password for $USERNAME:"
+passwd $USERNAME
 
 # Hostname, locale, timezone
-echo "__HOSTNAME__" > /etc/hostname
-ln -sf /usr/share/zoneinfo/__TIMEZONE__ /etc/localtime
+echo "$HOSTNAME" > /etc/hostname
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
 
 # Enable locale
-sed -i "s/^#\(__LOCALE__ UTF-8\)/\1/" /etc/locale.gen || true
+sed -i "s/^#($LOCALE UTF-8)/\1/" /etc/locale.gen || true
 locale-gen
-echo "LANG=__LOCALE__" > /etc/locale.conf
-echo "KEYMAP=__KEYMAP__" > /etc/vconsole.conf
+echo "LANG=$LOCALE" > /etc/locale.conf
+echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 
 # mkinitcpio hooks
 sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf || true
@@ -160,147 +160,112 @@ sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf 
 log "Building initramfs"
 mkinitcpio -P
 
-# Create btrfs swapfile safely with proper attributes
-log "Creating btrfs swapfile (/swapfile) size=__SWAP_SIZE__"
-rm -f /swapfile || true
-touch /swapfile
-chattr +C /swapfile
-btrfs filesystem mkswapfile --size __SWAP_SIZE__ /swapfile
+# Create btrfs swapfile safely
+log "Creating btrfs swapfile (/swapfile) size=$SWAP_SIZE"
+swapoff /swapfile 2>/dev/null || true
+rm -f /swapfile 2>/dev/null || true
+
+# Try btrfs command first, then fallback
+if btrfs filesystem mkswapfile --size $SWAP_SIZE /swapfile 2>/dev/null; then
+    log "Swapfile created using btrfs command"
+else
+    warn "Using manual swapfile creation"
+    truncate -s 0 /swapfile
+    chattr +C /swapfile
+    if [[ "$SWAP_SIZE" == *G ]]; then
+        size_gb=\${SWAP_SIZE%G}
+        dd if=/dev/zero of=/swapfile bs=1M count=\$((size_gb * 1024)) status=progress
+    elif [[ "$SWAP_SIZE" == *M ]]; then
+        size_mb=\${SWAP_SIZE%M}
+        dd if=/dev/zero of=/swapfile bs=1M count=\$size_mb status=progress
+    else
+        dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
+    fi
+fi
+
 chmod 600 /swapfile
 mkswap /swapfile
 swapon /swapfile
-if ! grep -q "^/swapfile" /etc/fstab; then
-  echo "/swapfile none swap defaults 0 0" >> /etc/fstab
-fi
+echo "/swapfile none swap defaults 0 0" >> /etc/fstab
 
 # Secure Boot
 log "Creating Secure Boot keys with sbctl"
 SECURE_BOOT=false
-if command -v sbctl >/dev/null 2>&1; then
-  if sbctl create-keys; then
+if sbctl create-keys; then
     SECURE_BOOT=true
-    log "Enrolling Secure Boot keys (manual mode - confirm at next boot)"
+    log "Enrolling Secure Boot keys (manual mode)"
     sbctl enroll-keys -m
-  else
-    warn "Failed to create Secure Boot keys, continuing without Secure Boot"
-  fi
 else
-  warn "sbctl not found, Secure Boot disabled"
+    warn "Failed to create Secure Boot keys"
 fi
 
 # Prepare kernel cmdline for UKI
-ROOT_UUID=$(blkid -s UUID -o value __ROOT_PART__)
-if [[ -z "$ROOT_UUID" ]]; then
-  error "Could not get root UUID"
-fi
-KERNEL_CMDLINE="rd.luks.name=$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw"
+ROOT_UUID=\$(blkid -s UUID -o value $ROOT_PART)
+[[ -z "\$ROOT_UUID" ]] && error "Could not get root UUID"
+KERNEL_CMDLINE="rd.luks.name=\$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw"
 
 # Determine microcode path
 MICROCODE_PATH=""
-if [[ -n "__MICROCODE__" ]]; then
-  if [[ -f "/boot/__MICROCODE__.img" ]]; then
-    MICROCODE_PATH="/boot/__MICROCODE__.img"
-    log "Including microcode: __MICROCODE__"
-  else
-    warn "Microcode package installed but .img file not found"
-  fi
+if [[ -n "$MICROCODE" && -f /boot/$MICROCODE.img ]]; then
+    MICROCODE_PATH="/boot/$MICROCODE.img"
+    log "Including microcode: $MICROCODE"
 fi
 
-# Create UKI directory on ESP
+# Create UKI directory
 mkdir -p /efi/EFI/Linux
 
-# Create combined initrd with microcode
+# Create combined initrd
 create_combined_initrd() {
-  local output_file="$1"
-  local initrd_file="$2"
-  
-  rm -f "$output_file" 2>/dev/null || true
-  
-  if [[ -n "$MICROCODE_PATH" && -f "$MICROCODE_PATH" && -f "$initrd_file" ]]; then
-    cat "$MICROCODE_PATH" "$initrd_file" > "$output_file"
-  elif [[ -f "$initrd_file" ]]; then
-    cp "$initrd_file" "$output_file"
-  else
-    error "Initrd file not found: $initrd_file"
-  fi
+    local output_file="\$1"
+    local initrd_file="\$2"
+    rm -f "\$output_file" 2>/dev/null || true
+    if [[ -n "\$MICROCODE_PATH" && -f "\$MICROCODE_PATH" ]]; then
+        cat "\$MICROCODE_PATH" "\$initrd_file" > "\$output_file"
+    else
+        cp "\$initrd_file" "\$output_file"
+    fi
 }
 
 # Build main UKI
-log "Building main UKI (/efi/EFI/Linux/arch.efi)"
-if [[ ! -f /boot/initramfs-linux.img ]]; then
-  error "Main initramfs not found, rebuilding..."
-  mkinitcpio -P
-fi
-
+log "Building main UKI"
 create_combined_initrd /tmp/combined-initrd.img /boot/initramfs-linux.img
+echo "\$KERNEL_CMDLINE" > /tmp/cmdline
 
-# Create temporary cmdline file
-echo "$KERNEL_CMDLINE" > /tmp/cmdline
-
-objcopy \
-  --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
-  --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \
-  --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \
-  --add-section .initrd=/tmp/combined-initrd.img --change-section-vma .initrd=0x3000000 \
+objcopy \\
+  --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \\
+  --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \\
+  --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \\
+  --add-section .initrd=/tmp/combined-initrd.img --change-section-vma .initrd=0x3000000 \\
   /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch.efi
 
-# Build fallback UKI if fallback initrd exists
+# Build fallback UKI if exists
 if [[ -f /boot/initramfs-linux-fallback.img ]]; then
-  log "Building fallback UKI (/efi/EFI/Linux/arch-fallback.efi)"
-  create_combined_initrd /tmp/combined-initrd-fallback.img /boot/initramfs-linux-fallback.img
-  
-  objcopy \
-    --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \
-    --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \
-    --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \
-    --add-section .initrd=/tmp/combined-initrd-fallback.img --change-section-vma .initrd=0x3000000 \
-    /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch-fallback.efi
+    log "Building fallback UKI"
+    create_combined_initrd /tmp/combined-initrd-fallback.img /boot/initramfs-linux-fallback.img
+    objcopy \\
+      --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \\
+      --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \\
+      --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \\
+      --add-section .initrd=/tmp/combined-initrd-fallback.img --change-section-vma .initrd=0x3000000 \\
+      /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch-fallback.efi
 fi
 
-# Sign UKIs if Secure Boot is enabled
-if [[ "$SECURE_BOOT" == true ]]; then
-  log "Signing UKIs"
-  if sbctl sign -s /efi/EFI/Linux/arch.efi; then
-    log "Signed main UKI"
-  else
-    warn "Failed to sign main UKI"
-  fi
-  
-  if [[ -f /efi/EFI/Linux/arch-fallback.efi ]]; then
-    if sbctl sign -s /efi/EFI/Linux/arch-fallback.efi; then
-      log "Signed fallback UKI"
-    else
-      warn "Failed to sign fallback UKI"
-    fi
-  fi
-else
-  warn "UKIs not signed (Secure Boot disabled)"
+# Sign UKIs if Secure Boot enabled
+if [[ "\$SECURE_BOOT" == true ]]; then
+    log "Signing UKIs"
+    sbctl sign -s /efi/EFI/Linux/arch.efi
+    [[ -f /efi/EFI/Linux/arch-fallback.efi ]] && sbctl sign -s /efi/EFI/Linux/arch-fallback.efi
 fi
 
 # Create UEFI boot entry
-log "Creating UEFI boot entry for UKI"
-EFI_DISK=$(lsblk -no pkname __ROOT_PART__ | head -1)
-if [[ -n "$EFI_DISK" ]]; then
-  EFI_DISK="/dev/$EFI_DISK"
-  if efibootmgr --create --disk "$EFI_DISK" --part 1 --label "Arch Linux" --loader '\EFI\Linux\arch.efi' --unicode; then
-    log "UEFI boot entry created successfully"
-  else
-    warn "Failed to create UEFI boot entry, you may need to create it manually in BIOS"
-  fi
-else
-  warn "Could not determine EFI disk for boot entry"
+log "Creating UEFI boot entry"
+EFI_DISK=\$(lsblk -no pkname $ROOT_PART | head -1)
+if [[ -n "\$EFI_DISK" ]]; then
+    efibootmgr --create --disk "/dev/\$EFI_DISK" --part 1 --label "Arch Linux" --loader '\\EFI\\Linux\\arch.efi' --unicode
 fi
 
-# Clean temp files
-rm -f /tmp/cmdline /tmp/combined-initrd.img /tmp/combined-initrd-fallback.img 2>/dev/null || true
-
-# Verify UKI creation
-if [[ ! -f /efi/EFI/Linux/arch.efi ]]; then
-  error "Main UKI creation failed!"
-fi
-
-log "UKI created successfully: /efi/EFI/Linux/arch.efi"
-log "File size: $(du -h /efi/EFI/Linux/arch.efi | cut -f1)"
+# Clean up
+rm -f /tmp/cmdline /tmp/combined-initrd*.img 2>/dev/null || true
 
 # Enable services
 systemctl enable NetworkManager
@@ -310,22 +275,10 @@ systemctl enable fstrim.timer
 echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
 chmod 0440 /etc/sudoers.d/wheel
 
-log "CHROOT STEP COMPLETE. Exit chroot, unmount and reboot when ready."
-log "Note: You will need to confirm Secure Boot key enrollment at next boot if enabled."
+log "CHROOT STEP COMPLETE. Exit chroot, unmount and reboot."
 EOF
-
-# Replace placeholders
-sed -i "s|__USERNAME__|$USERNAME|g" /mnt/root/arch_chroot.sh
-sed -i "s|__HOSTNAME__|$HOSTNAME|g" /mnt/root/arch_chroot.sh
-sed -i "s|__TIMEZONE__|$TIMEZONE|g" /mnt/root/arch_chroot.sh
-sed -i "s|__LOCALE__|$LOCALE|g" /mnt/root/arch_chroot.sh
-sed -i "s|__KEYMAP__|$KEYMAP|g" /mnt/root/arch_chroot.sh
-sed -i "s|__SWAP_SIZE__|$SWAP_SIZE|g" /mnt/root/arch_chroot.sh
-sed -i "s|__ROOT_PART__|$ROOT_PART|g" /mnt/root/arch_chroot.sh
-sed -i "s|__MICROCODE__|$MICROCODE|g" /mnt/root/arch_chroot.sh
 
 chmod +x /mnt/root/arch_chroot.sh
 
-log "Run the chroot script now to finish setup:"
-log "  arch-chroot /mnt /root/arch_chroot.sh"
-log "After chroot completes: umount -R /mnt && reboot"
+log "Chroot script created successfully with actual values"
+log "Run: arch-chroot /mnt /root/arch_chroot.sh"
