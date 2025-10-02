@@ -1,284 +1,277 @@
-#!/usr/bin/env bash
-# arch_auto_install.sh
-# One-shot installer: LUKS2 + Btrfs + UKI + Secure Boot
-# Run as root from Arch ISO
+#!/bin/bash
+# Arch Linux LUKS2 + Btrfs install script with UKI and SecureBoot
+# Based on: https://github.com/xdakota/arch-install-guide
+# Modified: LVM → Btrfs, stronger LUKS2 encryption
 
 set -euo pipefail
-IFS=$'\n\t'
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-log(){ echo -e "${GREEN}[+] $*${NC}"; }
-warn(){ echo -e "${YELLOW}[!] $*${NC}"; }
-error(){ echo -e "${RED}[ERROR] $*${NC}"; exit 1; }
-info(){ echo -e "${BLUE}[*] $*${NC}"; }
-
-[[ $EUID -eq 0 ]] || error "Run as root (from Arch live ISO)"
-[[ -d /sys/firmware/efi/efivars ]] || error "UEFI required"
-
-# Defaults (edit before running if desired)
-SWAP_SIZE="8G"
-HOSTNAME="archbtw"
-TIMEZONE="Africa/Algiers"
+# Configuration
+DISK="/dev/sda"
+EFI_SIZE="1024M"
+HOSTNAME="archlinux"
+USERNAME="archuser"
+PASSWORD="password"
+LUKS_PASSWORD="lukspassword"
+TIMEZONE="UTC"
 LOCALE="en_US.UTF-8"
-KEYMAP="us"
+UCODE="intel-ucode"  # Change to "amd-ucode" for AMD
 
-timedatectl set-ntp true
+# LUKS2 with Argon2id (strong 512-bit encryption)
+LUKS_CIPHER="aes-xts-plain64"
+LUKS_KEY_SIZE="512"
+LUKS_HASH="sha512"
+LUKS_ITER_TIME="5000"  # 5 seconds (very strong)
+LUKS_PBKDF="argon2id"
 
-# Disk selection
-info "Available disks:"; lsblk -d -o NAME,SIZE,TYPE,MODEL
-read -rp "Install to which disk (e.g. sda or /dev/nvme0n1): " DISK_INPUT
-[[ -n "$DISK_INPUT" ]] || error "No disk given"
-if [[ "$DISK_INPUT" == /dev/* ]]; then DISK="$DISK_INPUT"; else DISK="/dev/$DISK_INPUT"; fi
-[[ -b "$DISK" ]] || error "Disk $DISK not found"
-
-# CPU microcode detection
-MICROCODE=""
-if grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then MICROCODE="amd-ucode"; fi
-if grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null; then MICROCODE="intel-ucode"; fi
-
-# GPU
-echo -e "\n1) NVIDIA proprietary\n2) NVIDIA nouveau\n3) AMD\n4) Intel\n5) None"
-read -rp "GPU type [5]: " GPU_CHOICE
-GPU_CHOICE=${GPU_CHOICE:-5}
-
-# Username
-read -rp "New username: " USERNAME
-[[ -n "$USERNAME" ]] || error "Username empty"
-
-# Confirm
-clear
+echo "======================================"
+echo "Arch Linux Encrypted Install Script"
 echo "Disk: $DISK"
-echo "User: $USERNAME"
-echo "Swap size: $SWAP_SIZE"
-echo "Microcode: ${MICROCODE:-none}"
-warn "THIS WILL ERASE $DISK!"
-read -rp "Type YES to continue: " CONFIRM
-[[ "$CONFIRM" == "YES" ]] || error "Aborted by user"
+echo "LUKS: $LUKS_CIPHER with $LUKS_KEY_SIZE-bit key"
+echo "======================================"
+read -p "This will WIPE $DISK. Continue? (yes/no): " confirm
+[[ "$confirm" != "yes" ]] && exit 1
 
-# Partitioning (1 GiB EFI)
-log "Partitioning $DISK (1GiB EFI + rest)"
-parted --script "$DISK" mklabel gpt
-parted --script "$DISK" mkpart primary fat32 1MiB 1025MiB
-parted --script "$DISK" set 1 esp on
-parted --script "$DISK" mkpart primary 1025MiB 100%
+# 1. Partition disk
+echo "Creating partitions..."
+sgdisk --zap-all "$DISK"
+sgdisk -n 1:0:+${EFI_SIZE} -t 1:EF00 -c 1:"EFI" "$DISK"
+sgdisk -n 2:0:0 -t 2:8309 -c 2:"LUKS" "$DISK"
 
-if [[ "$DISK" == *nvme* ]]; then
-  EFI_PART="${DISK}p1"
-  ROOT_PART="${DISK}p2"
-else
-  EFI_PART="${DISK}1"
-  ROOT_PART="${DISK}2"
-fi
-log "EFI: $EFI_PART   ROOT: $ROOT_PART"
+EFI_PART="${DISK}1"
+LUKS_PART="${DISK}2"
 
-# LUKS2 encrypt root
-log "Formatting LUKS2 on $ROOT_PART (you will be prompted for a passphrase)"
-cryptsetup luksFormat \
-  --type luks2 --cipher aes-xts-plain64 --hash sha512 \
-  --iter-time 5000 --key-size 512 --pbkdf argon2id \
-  --use-urandom --verify-passphrase "$ROOT_PART"
+# 2. Format EFI
+echo "Formatting EFI partition..."
+mkfs.fat -F32 "$EFI_PART"
 
-log "Opening LUKS container"
-cryptsetup open "$ROOT_PART" cryptroot
+# 3. Setup LUKS2 with strong encryption
+echo "Setting up LUKS2 encryption (this will take ~${LUKS_ITER_TIME}ms per attempt)..."
+echo -n "$LUKS_PASSWORD" | cryptsetup luksFormat \
+    --type luks2 \
+    --cipher "$LUKS_CIPHER" \
+    --key-size "$LUKS_KEY_SIZE" \
+    --hash "$LUKS_HASH" \
+    --iter-time "$LUKS_ITER_TIME" \
+    --pbkdf "$LUKS_PBKDF" \
+    --use-random \
+    "$LUKS_PART" -
 
-# Filesystems
-log "Creating filesystems"
-mkfs.fat -F32 -n ARCH_EFI "$EFI_PART"
-mkfs.btrfs -f -L Arch_Root /dev/mapper/cryptroot
+echo -n "$LUKS_PASSWORD" | cryptsetup open --allow-discards --persistent "$LUKS_PART" cryptroot -
 
-# Btrfs subvolumes
-log "Creating Btrfs subvolumes"
+# 4. Create Btrfs filesystem
+echo "Creating Btrfs filesystem..."
+mkfs.btrfs -f /dev/mapper/cryptroot
 mount /dev/mapper/cryptroot /mnt
-for sub in @ @home @var @tmp @.snapshots; do
-  btrfs subvolume create /mnt/$sub
-done
+
+# 5. Create Btrfs subvolumes
+echo "Creating Btrfs subvolumes..."
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+btrfs subvolume create /mnt/@var
+btrfs subvolume create /mnt/@snapshots
 umount /mnt
 
-# Mount subvolumes with recommended options
-BTRFS_OPTS="noatime,space_cache=v2,compress=zstd:3"
-mount -o subvol=@,$BTRFS_OPTS /dev/mapper/cryptroot /mnt
-mkdir -p /mnt/{efi,home,var,tmp,.snapshots}
-mount -o subvol=@home,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/home
-mount -o subvol=@var,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/var
-mount -o subvol=@tmp,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/tmp
-mount -o subvol=@.snapshots,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/.snapshots
-mount "$EFI_PART" /mnt/efi
+# 6. Mount subvolumes
+echo "Mounting subvolumes..."
+mount -o subvol=@,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt
+mkdir -p /mnt/{home,var,.snapshots,boot/efi}
+mount -o subvol=@home,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/home
+mount -o subvol=@var,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/var
+mount -o subvol=@snapshots,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/.snapshots
+mount "$EFI_PART" /mnt/boot/efi
 
-# Install base packages
-PACKAGES=(base linux linux-headers linux-firmware btrfs-progs base-devel \
-          vim nano git cryptsetup sbctl efibootmgr dosfstools os-prober \
-          sudo networkmanager binutils)
-[[ -n "$MICROCODE" ]] && PACKAGES+=("$MICROCODE")
-case $GPU_CHOICE in
-  1) PACKAGES+=(nvidia nvidia-utils nvidia-settings) ;;
-  2) PACKAGES+=(xf86-video-nouveau) ;;
-  3) PACKAGES+=(mesa vulkan-radeon) ;;
-  4) PACKAGES+=(mesa libva-intel-driver intel-media-driver) ;;
-esac
+# 7. Install base system
+echo "Installing base system..."
+pacstrap -K /mnt base linux linux-firmware "$UCODE" sudo vim \
+    btrfs-progs dracut sbctl efibootmgr iwd git networkmanager
 
-log "Installing packages (pacstrap)"
-pacstrap /mnt "${PACKAGES[@]}"
+# 8. Generate fstab
+genfstab -U /mnt >> /mnt/etc/fstab
 
-log "Generating fstab"
-genfstab -U /mnt > /mnt/etc/fstab
+# Get UUIDs
+LUKS_UUID=$(blkid -s UUID -o value "$LUKS_PART")
 
-# Create chroot script with ACTUAL VALUES instead of placeholders
-log "Creating /root/arch_chroot.sh with actual values"
-cat > /mnt/root/arch_chroot.sh <<EOF
-#!/usr/bin/env bash
+# 9. Chroot configuration
+echo "Configuring system..."
+arch-chroot /mnt /bin/bash <<EOF
 set -euo pipefail
-IFS=$'\n\t'
-
-log(){ echo "[+] \$*"; }
-warn(){ echo "[!] \$*"; }
-error(){ echo "[ERROR] \$*"; exit 1; }
 
 # Root password
-echo "[*] Set root password:"
-passwd
+echo "root:$PASSWORD" | chpasswd
 
-# Create user
-useradd -m -G wheel -s /bin/bash $USERNAME
-echo "[*] Set password for $USERNAME:"
-passwd $USERNAME
-
-# Hostname, locale, timezone
-echo "$HOSTNAME" > /etc/hostname
+# Timezone
 ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
 
-# Enable locale
-sed -i "s/^#($LOCALE UTF-8)/\1/" /etc/locale.gen || true
+# Locale
+echo "$LOCALE UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=$LOCALE" > /etc/locale.conf
-echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 
-# mkinitcpio hooks
-sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect keyboard sd-vconsole modconf block sd-encrypt btrfs filesystems fsck)/' /etc/mkinitcpio.conf || true
+# Hostname
+echo "$HOSTNAME" > /etc/hostname
 
-# Build initramfs
-log "Building initramfs"
-mkinitcpio -P
-
-# Create btrfs swapfile safely
-log "Creating btrfs swapfile (/swapfile) size=$SWAP_SIZE"
-swapoff /swapfile 2>/dev/null || true
-rm -f /swapfile 2>/dev/null || true
-
-# Try btrfs command first, then fallback
-if btrfs filesystem mkswapfile --size $SWAP_SIZE /swapfile 2>/dev/null; then
-    log "Swapfile created using btrfs command"
-else
-    warn "Using manual swapfile creation"
-    truncate -s 0 /swapfile
-    chattr +C /swapfile
-    if [[ "$SWAP_SIZE" == *G ]]; then
-        size_gb=\${SWAP_SIZE%G}
-        dd if=/dev/zero of=/swapfile bs=1M count=\$((size_gb * 1024)) status=progress
-    elif [[ "$SWAP_SIZE" == *M ]]; then
-        size_mb=\${SWAP_SIZE%M}
-        dd if=/dev/zero of=/swapfile bs=1M count=\$size_mb status=progress
-    else
-        dd if=/dev/zero of=/swapfile bs=1M count=8192 status=progress
-    fi
-fi
-
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-echo "/swapfile none swap defaults 0 0" >> /etc/fstab
-
-# Secure Boot
-log "Creating Secure Boot keys with sbctl"
-SECURE_BOOT=false
-if sbctl create-keys; then
-    SECURE_BOOT=true
-    log "Enrolling Secure Boot keys (manual mode)"
-    sbctl enroll-keys -m
-else
-    warn "Failed to create Secure Boot keys"
-fi
-
-# Prepare kernel cmdline for UKI
-ROOT_UUID=\$(blkid -s UUID -o value $ROOT_PART)
-[[ -z "\$ROOT_UUID" ]] && error "Could not get root UUID"
-KERNEL_CMDLINE="rd.luks.name=\$ROOT_UUID=cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw"
-
-# Determine microcode path
-MICROCODE_PATH=""
-if [[ -n "$MICROCODE" && -f /boot/$MICROCODE.img ]]; then
-    MICROCODE_PATH="/boot/$MICROCODE.img"
-    log "Including microcode: $MICROCODE"
-fi
-
-# Create UKI directory
-mkdir -p /efi/EFI/Linux
-
-# Create combined initrd
-create_combined_initrd() {
-    local output_file="\$1"
-    local initrd_file="\$2"
-    rm -f "\$output_file" 2>/dev/null || true
-    if [[ -n "\$MICROCODE_PATH" && -f "\$MICROCODE_PATH" ]]; then
-        cat "\$MICROCODE_PATH" "\$initrd_file" > "\$output_file"
-    else
-        cp "\$initrd_file" "\$output_file"
-    fi
-}
-
-# Build main UKI
-log "Building main UKI"
-create_combined_initrd /tmp/combined-initrd.img /boot/initramfs-linux.img
-echo "\$KERNEL_CMDLINE" > /tmp/cmdline
-
-objcopy \\
-  --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \\
-  --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \\
-  --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \\
-  --add-section .initrd=/tmp/combined-initrd.img --change-section-vma .initrd=0x3000000 \\
-  /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch.efi
-
-# Build fallback UKI if exists
-if [[ -f /boot/initramfs-linux-fallback.img ]]; then
-    log "Building fallback UKI"
-    create_combined_initrd /tmp/combined-initrd-fallback.img /boot/initramfs-linux-fallback.img
-    objcopy \\
-      --add-section .osrel=/etc/os-release --change-section-vma .osrel=0x20000 \\
-      --add-section .cmdline=/tmp/cmdline --change-section-vma .cmdline=0x30000 \\
-      --add-section .linux=/boot/vmlinuz-linux --change-section-vma .linux=0x2000000 \\
-      --add-section .initrd=/tmp/combined-initrd-fallback.img --change-section-vma .initrd=0x3000000 \\
-      /usr/lib/systemd/boot/efi/linuxx64.efi.stub /efi/EFI/Linux/arch-fallback.efi
-fi
-
-# Sign UKIs if Secure Boot enabled
-if [[ "\$SECURE_BOOT" == true ]]; then
-    log "Signing UKIs"
-    sbctl sign -s /efi/EFI/Linux/arch.efi
-    [[ -f /efi/EFI/Linux/arch-fallback.efi ]] && sbctl sign -s /efi/EFI/Linux/arch-fallback.efi
-fi
-
-# Create UEFI boot entry
-log "Creating UEFI boot entry"
-EFI_DISK=\$(lsblk -no pkname $ROOT_PART | head -1)
-if [[ -n "\$EFI_DISK" ]]; then
-    efibootmgr --create --disk "/dev/\$EFI_DISK" --part 1 --label "Arch Linux" --loader '\\EFI\\Linux\\arch.efi' --unicode
-fi
-
-# Clean up
-rm -f /tmp/cmdline /tmp/combined-initrd*.img 2>/dev/null || true
+# User creation
+useradd -m -G wheel -s /bin/bash "$USERNAME"
+echo "$USERNAME:$PASSWORD" | chpasswd
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 # Enable services
 systemctl enable NetworkManager
 systemctl enable fstrim.timer
 
-# Sudoers
-echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
-chmod 0440 /etc/sudoers.d/wheel
+# ====================================
+# Dracut UKI Configuration
+# ====================================
 
-log "CHROOT STEP COMPLETE. Exit chroot, unmount and reboot."
+# Create dracut install script
+cat > /usr/local/bin/dracut-install.sh <<'SCRIPT'
+#!/usr/bin/env bash
+mkdir -p /boot/efi/EFI/Linux
+
+while read -r line; do
+    if [[ "\$line" == 'usr/lib/modules/'+([^/])'/pkgbase' ]]; then
+        kver="\${line#'usr/lib/modules/'}"
+        kver="\${kver%'/pkgbase'}"
+        
+        dracut --force --uefi --kver "\$kver" /boot/efi/EFI/Linux/bootx64.efi
+    fi
+done
+SCRIPT
+
+# Create dracut remove script
+cat > /usr/local/bin/dracut-remove.sh <<'SCRIPT'
+#!/usr/bin/env bash
+rm -f /boot/efi/EFI/Linux/bootx64.efi
+SCRIPT
+
+chmod +x /usr/local/bin/dracut-*.sh
+mkdir -p /etc/pacman.d/hooks
+
+# Dracut install hook
+cat > /etc/pacman.d/hooks/90-dracut-install.hook <<'HOOK'
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = usr/lib/modules/*/pkgbase
+
+[Action]
+Description = Updating linux EFI image
+When = PostTransaction
+Exec = /usr/local/bin/dracut-install.sh
+Depends = dracut
+NeedsTargets
+HOOK
+
+# Dracut remove hook
+cat > /etc/pacman.d/hooks/60-dracut-remove.hook <<'HOOK'
+[Trigger]
+Type = Path
+Operation = Remove
+Target = usr/lib/modules/*/pkgbase
+
+[Action]
+Description = Removing linux EFI image
+When = PreTransaction
+Exec = /usr/local/bin/dracut-remove.sh
+NeedsTargets
+HOOK
+
+# Dracut kernel cmdline
+cat > /etc/dracut.conf.d/cmdline.conf <<CMDLINE
+kernel_cmdline="rd.luks.uuid=luks-$LUKS_UUID root=/dev/mapper/cryptroot rootfstype=btrfs rootflags=subvol=@,rw,noatime,compress=zstd:1"
+CMDLINE
+
+# Dracut flags
+cat > /etc/dracut.conf.d/flags.conf <<FLAGS
+compress="zstd"
+hostonly="no"
+add_dracutmodules+=" crypt btrfs "
+FLAGS
+
+# SecureBoot configuration for dracut
+cat > /etc/dracut.conf.d/secureboot.conf <<SECUREBOOT
+uefi_secureboot_cert="/var/lib/sbctl/keys/db/db.pem"
+uefi_secureboot_key="/var/lib/sbctl/keys/db/db.key"
+SECUREBOOT
+
+# Generate UKI
+echo "Generating Unified Kernel Image..."
+pacman -S --noconfirm linux
+
+# ====================================
+# SecureBoot Setup
+# ====================================
+
+# Create SecureBoot keys
+echo "Creating SecureBoot keys..."
+sbctl create-keys
+sbctl sign -s /boot/efi/EFI/Linux/bootx64.efi
+
+# Override sbctl pacman hook
+cat > /etc/pacman.d/hooks/zz-sbctl.hook <<SBCTL
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = boot/*
+Target = efi/*
+Target = usr/lib/modules/*/vmlinuz
+Target = usr/lib/initcpio/*
+Target = usr/lib/**/efi/*.efi*
+
+[Action]
+Description = Signing EFI binaries...
+When = PostTransaction
+Exec = /usr/bin/sbctl sign /boot/efi/EFI/Linux/bootx64.efi
+SBCTL
+
+# Enroll keys (with Microsoft keys for dual-boot compatibility)
+echo "Enrolling SecureBoot keys..."
+sbctl enroll-keys --microsoft
+
+# ====================================
+# UEFI Boot Entry
+# ====================================
+
+# Create UEFI boot entry
+efibootmgr --create --disk $DISK --part 1 --label "Arch Linux" --loader 'EFI\Linux\bootx64.efi' --unicode
+
+# Set boot order (get the number from last entry)
+BOOT_NUM=\$(efibootmgr | grep "Arch Linux" | cut -d' ' -f1 | tr -d 'Boot*')
+efibootmgr -o \$BOOT_NUM
+
+echo "Boot entry created: \$BOOT_NUM"
+
 EOF
 
-chmod +x /mnt/root/arch_chroot.sh
+# 10. Cleanup
+echo "Unmounting filesystems..."
+umount -R /mnt
+cryptsetup close cryptroot
 
-log "Chroot script created successfully with actual values"
-log "Run: arch-chroot /mnt /root/arch_chroot.sh"
+echo ""
+echo "✅ Installation complete!"
+echo ""
+echo "======================================"
+echo "NEXT STEPS:"
+echo "======================================"
+echo "1. Reboot your system"
+echo "2. Enter BIOS/UEFI setup"
+echo "3. Enable 'Setup Mode' for SecureBoot"
+echo "4. Enable SecureBoot"
+echo "5. Set BIOS password"
+echo "6. Boot into Arch Linux"
+echo "7. Enter LUKS password: $LUKS_PASSWORD"
+echo ""
+echo "Verify SecureBoot status with:"
+echo "  sbctl status"
+echo ""
+echo "LUKS Encryption Details:"
+echo "  Cipher: $LUKS_CIPHER"
+echo "  Key Size: $LUKS_KEY_SIZE-bit"
+echo "  PBKDF: $LUKS_PBKDF"
+echo "  Iteration Time: ${LUKS_ITER_TIME}ms"
+echo "======================================"
