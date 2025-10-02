@@ -88,7 +88,7 @@ reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorli
 # 8. Install base system
 echo "Installing base system..."
 pacstrap -K /mnt base linux linux-firmware "$UCODE" sudo vim \
-    btrfs-progs dracut sbctl efibootmgr iwd git networkmanager
+    btrfs-progs dracut sbctl sbsigntools efibootmgr iwd git networkmanager
 
 # 9. Generate fstab
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -183,6 +183,14 @@ Exec = /usr/local/bin/dracut-remove.sh
 NeedsTargets
 HOOK
 
+# ====================================
+# SecureBoot Setup
+# ====================================
+
+# Create SecureBoot keys BEFORE generating UKI
+echo "Creating SecureBoot keys..."
+sbctl create-keys
+
 # Dracut kernel cmdline
 cat > /etc/dracut.conf.d/cmdline.conf <<CMDLINE
 kernel_cmdline="rd.luks.uuid=luks-$LUKS_UUID root=/dev/mapper/cryptroot rootfstype=btrfs rootflags=subvol=@,rw,noatime,compress=zstd:1"
@@ -195,24 +203,24 @@ hostonly="no"
 add_dracutmodules+=" crypt btrfs "
 FLAGS
 
-# SecureBoot configuration for dracut
+# SecureBoot configuration for dracut (NOW keys exist)
 cat > /etc/dracut.conf.d/secureboot.conf <<SECUREBOOT
 uefi_secureboot_cert="/var/lib/sbctl/keys/db/db.pem"
 uefi_secureboot_key="/var/lib/sbctl/keys/db/db.key"
 SECUREBOOT
 
-# Generate UKI
+# Generate UKI (will auto-sign with dracut)
 echo "Generating Unified Kernel Image..."
 pacman -S --noconfirm linux
 
-# ====================================
-# SecureBoot Setup
-# ====================================
-
-# Create SecureBoot keys
-echo "Creating SecureBoot keys..."
-sbctl create-keys
-sbctl sign -s /boot/efi/EFI/Linux/bootx64.efi
+# Verify UKI was created and sign with sbctl too
+if [[ -f /boot/efi/EFI/Linux/bootx64.efi ]]; then
+    echo "UKI created successfully, signing with sbctl..."
+    sbctl sign -s /boot/efi/EFI/Linux/bootx64.efi
+else
+    echo "ERROR: UKI was not created!"
+    exit 1
+fi
 
 # Override sbctl pacman hook
 cat > /etc/pacman.d/hooks/zz-sbctl.hook <<SBCTL
