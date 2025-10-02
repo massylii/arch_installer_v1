@@ -9,12 +9,12 @@ set -euo pipefail
 DISK="/dev/sda"
 EFI_SIZE="1024M"
 HOSTNAME="archlinux"
-USERNAME="archuser"
+USERNAME="massylii"
 PASSWORD="password"
-LUKS_PASSWORD="lukspassword"
+LUKS_PASSWORD="password"
 TIMEZONE="UTC"
 LOCALE="en_US.UTF-8"
-UCODE="intel-ucode"  # Change to "amd-ucode" for AMD
+UCODE="amd-ucode"  # Change to "amd-ucode" for AMD
 
 # LUKS2 with Argon2id (strong 512-bit encryption)
 LUKS_CIPHER="aes-xts-plain64"
