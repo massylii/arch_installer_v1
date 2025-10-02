@@ -80,18 +80,23 @@ mount -o subvol=@var,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/var
 mount -o subvol=@snapshots,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/.snapshots
 mount "$EFI_PART" /mnt/boot/efi
 
-# 7. Install base system
+# 7. Update mirrorlist for faster downloads
+echo "Updating mirrorlist..."
+pacman -Sy --noconfirm reflector
+reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+
+# 8. Install base system
 echo "Installing base system..."
 pacstrap -K /mnt base linux linux-firmware "$UCODE" sudo vim \
     btrfs-progs dracut sbctl efibootmgr iwd git networkmanager
 
-# 8. Generate fstab
+# 9. Generate fstab
 genfstab -U /mnt >> /mnt/etc/fstab
 
 # Get UUIDs
 LUKS_UUID=$(blkid -s UUID -o value "$LUKS_PART")
 
-# 9. Chroot configuration
+# 10. Chroot configuration
 echo "Configuring system..."
 arch-chroot /mnt /bin/bash <<EOF
 set -euo pipefail
@@ -247,7 +252,7 @@ echo "Boot entry created: \$BOOT_NUM"
 
 EOF
 
-# 10. Cleanup
+# 11. Cleanup
 echo "Unmounting filesystems..."
 umount -R /mnt
 cryptsetup close cryptroot
