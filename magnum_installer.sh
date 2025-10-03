@@ -28,6 +28,7 @@ echo ""
 read -p "Enter your hostname: " HOSTNAME
 read -p "Enter your username: " USERNAME
 read -p "Intel or AMD CPU? (intel/amd): " CPU_VENDOR
+read -p "Enter timezone (e.g., Europe/London, Africa/Algiers): " TIMEZONE
 
 if [ "$CPU_VENDOR" = "intel" ]; then
     UCODE="intel-ucode"
@@ -35,6 +36,12 @@ elif [ "$CPU_VENDOR" = "amd" ]; then
     UCODE="amd-ucode"
 else
     echo "Invalid CPU vendor. Please enter 'intel' or 'amd'."
+    exit 1
+fi
+
+# Validate username
+if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "Error: Username must contain only lowercase letters, numbers, hyphens, and underscores"
     exit 1
 fi
 
@@ -87,23 +94,25 @@ btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
 btrfs subvolume create /mnt/@var
 btrfs subvolume create /mnt/@snapshots
+btrfs subvolume create /mnt/@tmp
 umount /mnt
 
 # Mount subvolumes
 echo ""
 echo "Mounting subvolumes..."
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@ /dev/mapper/$CRYPT_NAME /mnt
-mkdir -p /mnt/{home,var,.snapshots,boot,efi}
+mkdir -p /mnt/{home,var,.snapshots,tmp,efi}
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@home /dev/mapper/$CRYPT_NAME /mnt/home
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@var /dev/mapper/$CRYPT_NAME /mnt/var
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@snapshots /dev/mapper/$CRYPT_NAME /mnt/.snapshots
+mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@tmp /dev/mapper/$CRYPT_NAME /mnt/tmp
 mount $EFI_PART /mnt/efi
 
 # Install base system with secure boot tools
 echo ""
 echo "Installing base system..."
 pacstrap /mnt base linux linux-firmware linux-headers $UCODE sudo vim mkinitcpio \
-    git efibootmgr networkmanager btrfs-progs sbctl
+    git efibootmgr networkmanager btrfs-progs sbctl man-db htop
 
 # Generate fstab
 echo ""
@@ -122,17 +131,15 @@ echo ""
 echo "Set root password:"
 passwd
 
-# Install additional packages
-pacman -Syu --noconfirm man-db htop
-
 # Create user
-useradd -m -G wheel $USERNAME
+useradd -m -G wheel,audio,video,storage $USERNAME
 echo ""
 echo "Set password for $USERNAME:"
 passwd $USERNAME
 
 # Configure sudo
-sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
+chmod 440 /etc/sudoers.d/wheel
 
 # Set hostname
 echo "$HOSTNAME" > /etc/hostname
@@ -144,8 +151,8 @@ cat > /etc/hosts <<EOL
 127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
 EOL
 
-# Set timezone (adjust as needed)
-ln -sf /usr/share/zoneinfo/Europe/London /etc/localtime
+# Set timezone
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
 
 # Generate locale
@@ -160,15 +167,12 @@ systemctl enable fstrim.timer
 # Configure mkinitcpio for encryption
 sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
 
-# Install systemd-boot
-bootctl install
-
 # Get UUID of encrypted partition
 UUID=\$(blkid -s UUID -o value $ROOT_PART)
 
-# Create kernel command line
+# Create kernel command line for UKIs
 mkdir -p /etc/kernel
-echo "rd.luks.name=\${UUID}=$CRYPT_NAME root=/dev/mapper/$CRYPT_NAME rootflags=subvol=@ rw quiet splash lsm=landlock,lockdown,yama,integrity,apparmor,bpf" > /etc/kernel/cmdline
+echo "rd.luks.name=\$UUID=$CRYPT_NAME root=/dev/mapper/$CRYPT_NAME rootflags=subvol=@ rw quiet splash" > /etc/kernel/cmdline
 
 # Configure UKI in linux preset
 cat > /etc/mkinitcpio.d/linux.preset <<PRESET
@@ -185,7 +189,11 @@ fallback_uki="/efi/EFI/Linux/arch-linux-fallback.efi"
 fallback_options="-S autodetect"
 PRESET
 
-# Regenerate initramfs
+# Install systemd-boot
+bootctl install --esp-path=/efi
+
+# Regenerate initramfs and build UKIs
+echo "Generating Unified Kernel Images..."
 mkinitcpio -P
 
 # Configure systemd-boot
@@ -218,23 +226,31 @@ echo ""
 echo "Verifying Secure Boot signatures..."
 sbctl verify
 
+# Create BTRFS-compatible swap file
+echo ""
+echo "Creating encrypted swap file (2GB)..."
+btrfs filesystem mkswapfile --size 2g --uuid clear /swapfile
+swapon /swapfile
+echo "/swapfile none swap defaults 0 0" >> /etc/fstab
+
 echo ""
 echo "=========================================="
 echo "Installation complete!"
 echo "=========================================="
 echo ""
 echo "System configured with:"
-echo "- BTRFS filesystem with subvolumes"
+echo "- BTRFS filesystem with subvolumes (@, @home, @var, @tmp, @snapshots)"
 echo "- LUKS2 encryption (AES-XTS-512, Argon2id)"
 echo "- Secure Boot ready (keys enrolled)"
+echo "- Unified Kernel Images"
 echo "- User: $USERNAME"
 echo "- Hostname: $HOSTNAME"
+echo "- Timezone: $TIMEZONE"
 echo ""
 echo "IMPORTANT POST-INSTALL STEPS:"
 echo "1. Reboot and enter BIOS/UEFI settings"
 echo "2. Enable Secure Boot"
 echo "3. Set BIOS supervisor password (recommended)"
-echo "4. Clear any old Secure Boot keys if needed"
 echo ""
 EOF
 
@@ -262,5 +278,7 @@ echo "✓ LUKS2 with 512-bit AES-XTS encryption"
 echo "✓ Argon2id key derivation (5 second iteration)"
 echo "✓ Secure Boot keys created and enrolled"
 echo "✓ All boot components signed"
-echo "✓ systemd-based encryption hooks"
+echo "✓ Unified Kernel Images"
+echo "✓ Encrypted swap file (BTRFS-compatible)"
+echo "✓ BTRFS subvolumes with zstd compression"
 echo ""
