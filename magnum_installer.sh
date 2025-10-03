@@ -229,9 +229,14 @@ sbctl verify
 # Create BTRFS-compatible swap file
 echo ""
 echo "Creating encrypted swap file (2GB)..."
-# Create swap subvolume (no COW for swap)
+# Create swap subvolume and disable COW
 btrfs subvolume create /swap
 chattr +C /swap
+# Create empty file and disable compression
+truncate -s 0 /swap/swapfile
+chattr +C /swap/swapfile
+btrfs property set /swap/swapfile compression none
+# Allocate space
 dd if=/dev/zero of=/swap/swapfile bs=1M count=2048 status=progress
 chmod 600 /swap/swapfile
 mkswap /swap/swapfile
