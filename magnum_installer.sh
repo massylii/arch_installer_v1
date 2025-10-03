@@ -2,7 +2,7 @@
 set -e
 
 # Arch Linux Secure Installation Script
-# Features: BTRFS, LUKS2 with 512-bit encryption, Secure Boot support
+# Features: BTRFS, LUKS2 with strong encryption, Secure Boot support
 # Target disk: /dev/sda
 
 echo "=========================================="
@@ -63,18 +63,17 @@ echo ""
 echo "Formatting EFI partition..."
 mkfs.fat -F32 $EFI_PART
 
-# Setup LUKS2 encryption with strong settings
+# Setup LUKS2 encryption (strong but usable)
 echo ""
-echo "Setting up LUKS2 encryption with 512-bit key..."
-echo "Using strong encryption: aes-xts-plain64 with 512-bit key and argon2id"
+echo "Setting up LUKS2 encryption..."
 cryptsetup luksFormat --type luks2 \
     --cipher aes-xts-plain64 \
     --key-size 512 \
     --hash sha512 \
     --pbkdf argon2id \
-    --pbkdf-memory 1048576 \
+    --pbkdf-memory 262144 \
     --pbkdf-parallel 4 \
-    --iter-time 5000 \
+    --iter-time 3000 \
     $ROOT_PART
 
 echo ""
@@ -101,12 +100,12 @@ umount /mnt
 echo ""
 echo "Mounting subvolumes..."
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@ /dev/mapper/$CRYPT_NAME /mnt
-mkdir -p /mnt/{home,var,.snapshots,tmp,efi}
+mkdir -p /mnt/{home,var,.snapshots,tmp,boot}
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@home /dev/mapper/$CRYPT_NAME /mnt/home
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@var /dev/mapper/$CRYPT_NAME /mnt/var
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@snapshots /dev/mapper/$CRYPT_NAME /mnt/.snapshots
 mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@tmp /dev/mapper/$CRYPT_NAME /mnt/tmp
-mount $EFI_PART /mnt/efi
+mount $EFI_PART /mnt/boot
 
 # Install base system with secure boot tools
 echo ""
@@ -182,22 +181,22 @@ ALL_microcode=(/boot/*-ucode.img)
 
 PRESETS=('default' 'fallback')
 
-default_uki="/efi/EFI/Linux/arch-linux.efi"
+default_uki="/boot/EFI/Linux/arch-linux.efi"
 default_options="--splash /usr/share/systemd/bootctl/splash-arch.bmp"
 
-fallback_uki="/efi/EFI/Linux/arch-linux-fallback.efi"
+fallback_uki="/boot/EFI/Linux/arch-linux-fallback.efi"
 fallback_options="-S autodetect"
 PRESET
 
 # Install systemd-boot
-bootctl install --esp-path=/efi
+bootctl install
 
 # Regenerate initramfs and build UKIs
 echo "Generating Unified Kernel Images..."
 mkinitcpio -P
 
 # Configure systemd-boot
-cat > /efi/loader/loader.conf <<LOADER
+cat > /boot/loader/loader.conf <<LOADER
 default arch-linux.efi
 timeout 3
 console-mode max
@@ -207,37 +206,26 @@ LOADER
 # Setup Secure Boot
 echo ""
 echo "Setting up Secure Boot..."
-echo "Creating and enrolling Secure Boot keys..."
-
-# Create Secure Boot keys
 sbctl create-keys
-
-# Enroll keys (with Microsoft keys for compatibility)
 sbctl enroll-keys -m
 
 # Sign bootloader and kernel
-sbctl sign -s /efi/EFI/BOOT/BOOTX64.EFI
-sbctl sign -s /efi/EFI/systemd/systemd-bootx64.efi
-sbctl sign -s /efi/EFI/Linux/arch-linux.efi
-sbctl sign -s /efi/EFI/Linux/arch-linux-fallback.efi
+sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI
+sbctl sign -s /boot/EFI/systemd/systemd-bootx64.efi
+sbctl sign -s /boot/EFI/Linux/arch-linux.efi
+sbctl sign -s /boot/EFI/Linux/arch-linux-fallback.efi
 
 # Verify signing
-echo ""
-echo "Verifying Secure Boot signatures..."
 sbctl verify
 
-# Create BTRFS-compatible swap file
+# Create encrypted swap file (16GB) on root subvolume
 echo ""
-echo "Creating encrypted swap file (16GB)..."
-# Create swap subvolume and disable COW
-btrfs subvolume create /swap
-chattr +C /swap
-# Create empty file and disable compression
+echo "Creating encrypted swap file..."
+mkdir -p /swap
 truncate -s 0 /swap/swapfile
 chattr +C /swap/swapfile
 btrfs property set /swap/swapfile compression none
-# Allocate space
-dd if=/dev/zero of=/swap/swapfile bs=1M count=16325 status=progress
+dd if=/dev/zero of=/swap/swapfile bs=1M count=16384 status=progress
 chmod 600 /swap/swapfile
 mkswap /swap/swapfile
 swapon /swap/swapfile
@@ -247,21 +235,6 @@ echo ""
 echo "=========================================="
 echo "Installation complete!"
 echo "=========================================="
-echo ""
-echo "System configured with:"
-echo "- BTRFS filesystem with subvolumes (@, @home, @var, @tmp, @snapshots, /swap)"
-echo "- LUKS2 encryption (AES-XTS-512, Argon2id)"
-echo "- Secure Boot ready (keys enrolled)"
-echo "- Unified Kernel Images"
-echo "- User: $USERNAME"
-echo "- Hostname: $HOSTNAME"
-echo "- Timezone: $TIMEZONE"
-echo ""
-echo "IMPORTANT POST-INSTALL STEPS:"
-echo "1. Reboot and enter BIOS/UEFI settings"
-echo "2. Enable Secure Boot"
-echo "3. Set BIOS supervisor password (recommended)"
-echo ""
 EOF
 
 # Unmount and close
@@ -282,13 +255,3 @@ echo "3. Enter BIOS and enable Secure Boot"
 echo "4. Boot into your new system"
 echo "5. You'll be prompted for LUKS password"
 echo "6. Check Secure Boot status: sbctl status"
-echo ""
-echo "Security features enabled:"
-echo "✓ LUKS2 with 512-bit AES-XTS encryption"
-echo "✓ Argon2id key derivation (5 second iteration)"
-echo "✓ Secure Boot keys created and enrolled"
-echo "✓ All boot components signed"
-echo "✓ Unified Kernel Images"
-echo "✓ Encrypted swap file (BTRFS-compatible)"
-echo "✓ BTRFS subvolumes with zstd compression"
-echo ""
