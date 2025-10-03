@@ -229,9 +229,14 @@ sbctl verify
 # Create BTRFS-compatible swap file
 echo ""
 echo "Creating encrypted swap file (2GB)..."
-btrfs filesystem mkswapfile --size 2g --uuid clear /swapfile
-swapon /swapfile
-echo "/swapfile none swap defaults 0 0" >> /etc/fstab
+# Create swap subvolume (no COW for swap)
+btrfs subvolume create /swap
+chattr +C /swap
+dd if=/dev/zero of=/swap/swapfile bs=1M count=2048 status=progress
+chmod 600 /swap/swapfile
+mkswap /swap/swapfile
+swapon /swap/swapfile
+echo "/swap/swapfile none swap defaults 0 0" >> /etc/fstab
 
 echo ""
 echo "=========================================="
@@ -239,7 +244,7 @@ echo "Installation complete!"
 echo "=========================================="
 echo ""
 echo "System configured with:"
-echo "- BTRFS filesystem with subvolumes (@, @home, @var, @tmp, @snapshots)"
+echo "- BTRFS filesystem with subvolumes (@, @home, @var, @tmp, @snapshots, /swap)"
 echo "- LUKS2 encryption (AES-XTS-512, Argon2id)"
 echo "- Secure Boot ready (keys enrolled)"
 echo "- Unified Kernel Images"
