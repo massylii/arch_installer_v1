@@ -1,290 +1,266 @@
 #!/bin/bash
-# Arch Linux LUKS2 + Btrfs install script with UKI and SecureBoot
-# Based on: https://github.com/xdakota/arch-install-guide
-# Modified: LVM → Btrfs, stronger LUKS2 encryption
+set -e
 
-set -euo pipefail
+# Arch Linux Secure Installation Script
+# Features: BTRFS, LUKS2 with 512-bit encryption, Secure Boot support
+# Target disk: /dev/sda
 
-# Configuration
+echo "=========================================="
+echo "Arch Linux Secure Installation"
+echo "LUKS2 + BTRFS + Secure Boot"
+echo "=========================================="
+echo ""
+echo "WARNING: This will ERASE ALL DATA on /dev/sda"
+echo ""
+read -p "Are you sure you want to continue? (yes/no): " confirm
+if [ "$confirm" != "yes" ]; then
+    echo "Installation cancelled."
+    exit 1
+fi
+
+# Variables
 DISK="/dev/sda"
-EFI_SIZE="1024M"
-HOSTNAME="archlinux"
-USERNAME="massylii"
-PASSWORD="password"
-LUKS_PASSWORD="password"
-TIMEZONE="UTC"
-LOCALE="en_US.UTF-8"
-UCODE="amd-ucode"  # Change to "amd-ucode" for AMD
-
-# LUKS2 with Argon2id (strong 512-bit encryption)
-LUKS_CIPHER="aes-xts-plain64"
-LUKS_KEY_SIZE="512"
-LUKS_HASH="sha512"
-LUKS_ITER_TIME="5000"  # 5 seconds (very strong)
-LUKS_PBKDF="argon2id"
-
-echo "======================================"
-echo "Arch Linux Encrypted Install Script"
-echo "Disk: $DISK"
-echo "LUKS: $LUKS_CIPHER with $LUKS_KEY_SIZE-bit key"
-echo "======================================"
-read -p "This will WIPE $DISK. Continue? (yes/no): " confirm
-[[ "$confirm" != "yes" ]] && exit 1
-
-# 1. Partition disk
-echo "Creating partitions..."
-sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:+${EFI_SIZE} -t 1:EF00 -c 1:"EFI" "$DISK"
-sgdisk -n 2:0:0 -t 2:8309 -c 2:"LUKS" "$DISK"
-
 EFI_PART="${DISK}1"
-LUKS_PART="${DISK}2"
+ROOT_PART="${DISK}2"
+CRYPT_NAME="cryptroot"
 
-# 2. Format EFI
+echo ""
+read -p "Enter your hostname: " HOSTNAME
+read -p "Enter your username: " USERNAME
+read -p "Intel or AMD CPU? (intel/amd): " CPU_VENDOR
+
+if [ "$CPU_VENDOR" = "intel" ]; then
+    UCODE="intel-ucode"
+elif [ "$CPU_VENDOR" = "amd" ]; then
+    UCODE="amd-ucode"
+else
+    echo "Invalid CPU vendor. Please enter 'intel' or 'amd'."
+    exit 1
+fi
+
+echo ""
+echo "=========================================="
+echo "Starting installation..."
+echo "=========================================="
+
+# Partition the disk
+echo ""
+echo "Partitioning disk..."
+parted -s $DISK mklabel gpt
+parted -s $DISK mkpart primary fat32 1MiB 1025MiB
+parted -s $DISK set 1 esp on
+parted -s $DISK mkpart primary 1025MiB 100%
+
+# Format EFI partition
+echo ""
 echo "Formatting EFI partition..."
-mkfs.fat -F32 "$EFI_PART"
+mkfs.fat -F32 $EFI_PART
 
-# 3. Setup LUKS2 with strong encryption
-echo "Setting up LUKS2 encryption (this will take ~${LUKS_ITER_TIME}ms per attempt)..."
-echo -n "$LUKS_PASSWORD" | cryptsetup luksFormat \
-    --type luks2 \
-    --cipher "$LUKS_CIPHER" \
-    --key-size "$LUKS_KEY_SIZE" \
-    --hash "$LUKS_HASH" \
-    --iter-time "$LUKS_ITER_TIME" \
-    --pbkdf "$LUKS_PBKDF" \
-    --use-random \
-    "$LUKS_PART" -
+# Setup LUKS2 encryption with strong settings
+echo ""
+echo "Setting up LUKS2 encryption with 512-bit key..."
+echo "Using strong encryption: aes-xts-plain64 with 512-bit key and argon2id"
+cryptsetup luksFormat --type luks2 \
+    --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --hash sha512 \
+    --pbkdf argon2id \
+    --pbkdf-memory 1048576 \
+    --pbkdf-parallel 4 \
+    --iter-time 5000 \
+    $ROOT_PART
 
-echo -n "$LUKS_PASSWORD" | cryptsetup open --allow-discards --persistent "$LUKS_PART" cryptroot -
+echo ""
+echo "Opening encrypted partition..."
+cryptsetup open $ROOT_PART $CRYPT_NAME
 
-# 4. Create Btrfs filesystem
-echo "Creating Btrfs filesystem..."
-mkfs.btrfs -f /dev/mapper/cryptroot
-mount /dev/mapper/cryptroot /mnt
+# Format with BTRFS
+echo ""
+echo "Creating BTRFS filesystem..."
+mkfs.btrfs -L ArchLinux /dev/mapper/$CRYPT_NAME
 
-# 5. Create Btrfs subvolumes
-echo "Creating Btrfs subvolumes..."
+# Mount and create subvolumes
+echo ""
+echo "Creating BTRFS subvolumes..."
+mount /dev/mapper/$CRYPT_NAME /mnt
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
 btrfs subvolume create /mnt/@var
 btrfs subvolume create /mnt/@snapshots
 umount /mnt
 
-# 6. Mount subvolumes
+# Mount subvolumes
+echo ""
 echo "Mounting subvolumes..."
-mount -o subvol=@,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt
-mkdir -p /mnt/{home,var,.snapshots,boot/efi}
-mount -o subvol=@home,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/home
-mount -o subvol=@var,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/var
-mount -o subvol=@snapshots,compress=zstd:1,noatime /dev/mapper/cryptroot /mnt/.snapshots
-mount "$EFI_PART" /mnt/boot/efi
+mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@ /dev/mapper/$CRYPT_NAME /mnt
+mkdir -p /mnt/{home,var,.snapshots,boot,efi}
+mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@home /dev/mapper/$CRYPT_NAME /mnt/home
+mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@var /dev/mapper/$CRYPT_NAME /mnt/var
+mount -o noatime,compress=zstd:1,space_cache=v2,subvol=@snapshots /dev/mapper/$CRYPT_NAME /mnt/.snapshots
+mount $EFI_PART /mnt/efi
 
-# 7. Update mirrorlist for faster downloads
-echo "Updating mirrorlist..."
-pacman -Sy --noconfirm reflector
-reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
-
-# 8. Install base system
+# Install base system with secure boot tools
+echo ""
 echo "Installing base system..."
-pacstrap -K /mnt base linux linux-firmware "$UCODE" sudo vim \
-    btrfs-progs dracut sbctl sbsigntools efibootmgr iwd git networkmanager
+pacstrap /mnt base linux linux-firmware linux-headers $UCODE sudo vim mkinitcpio \
+    git efibootmgr networkmanager btrfs-progs sbctl
 
-# 9. Generate fstab
+# Generate fstab
+echo ""
+echo "Generating fstab..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# Get UUIDs
-LUKS_UUID=$(blkid -s UUID -o value "$LUKS_PART")
-
-# 10. Chroot configuration
+# Chroot and configure
+echo ""
 echo "Configuring system..."
+
 arch-chroot /mnt /bin/bash <<EOF
-set -euo pipefail
+set -e
 
-# Root password
-echo "root:$PASSWORD" | chpasswd
+# Set root password
+echo ""
+echo "Set root password:"
+passwd
 
-# Timezone
-ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
-hwclock --systohc
+# Install additional packages
+pacman -Syu --noconfirm man-db htop
 
-# Locale
-echo "$LOCALE UTF-8" > /etc/locale.gen
-locale-gen
-echo "LANG=$LOCALE" > /etc/locale.conf
+# Create user
+useradd -m -G wheel $USERNAME
+echo ""
+echo "Set password for $USERNAME:"
+passwd $USERNAME
 
-# Hostname
+# Configure sudo
+sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+
+# Set hostname
 echo "$HOSTNAME" > /etc/hostname
 
-# User creation
-useradd -m -G wheel -s /bin/bash "$USERNAME"
-echo "$USERNAME:$PASSWORD" | chpasswd
-sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+# Configure hosts
+cat > /etc/hosts <<EOL
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+EOL
+
+# Set timezone (adjust as needed)
+ln -sf /usr/share/zoneinfo/Europe/London /etc/localtime
+hwclock --systohc
+
+# Generate locale
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
 # Enable services
 systemctl enable NetworkManager
 systemctl enable fstrim.timer
 
-# ====================================
-# Dracut UKI Configuration
-# ====================================
+# Configure mkinitcpio for encryption
+sed -i 's/^HOOKS=.*/HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block sd-encrypt filesystems fsck)/' /etc/mkinitcpio.conf
 
-# Create dracut install script
-cat > /usr/local/bin/dracut-install.sh <<'SCRIPT'
-#!/usr/bin/env bash
-mkdir -p /boot/efi/EFI/Linux
+# Install systemd-boot
+bootctl install
 
-while read -r line; do
-    if [[ "\$line" == 'usr/lib/modules/'+([^/])'/pkgbase' ]]; then
-        kver="\${line#'usr/lib/modules/'}"
-        kver="\${kver%'/pkgbase'}"
-        
-        dracut --force --uefi --kver "\$kver" /boot/efi/EFI/Linux/bootx64.efi
-    fi
-done
-SCRIPT
+# Get UUID of encrypted partition
+UUID=\$(blkid -s UUID -o value $ROOT_PART)
 
-# Create dracut remove script
-cat > /usr/local/bin/dracut-remove.sh <<'SCRIPT'
-#!/usr/bin/env bash
-rm -f /boot/efi/EFI/Linux/bootx64.efi
-SCRIPT
+# Create kernel command line
+mkdir -p /etc/kernel
+echo "rd.luks.name=\${UUID}=$CRYPT_NAME root=/dev/mapper/$CRYPT_NAME rootflags=subvol=@ rw quiet splash lsm=landlock,lockdown,yama,integrity,apparmor,bpf" > /etc/kernel/cmdline
 
-chmod +x /usr/local/bin/dracut-*.sh
-mkdir -p /etc/pacman.d/hooks
+# Configure UKI in linux preset
+cat > /etc/mkinitcpio.d/linux.preset <<PRESET
+ALL_config="/etc/mkinitcpio.conf"
+ALL_kver="/boot/vmlinuz-linux"
+ALL_microcode=(/boot/*-ucode.img)
 
-# Dracut install hook
-cat > /etc/pacman.d/hooks/90-dracut-install.hook <<'HOOK'
-[Trigger]
-Type = Path
-Operation = Install
-Operation = Upgrade
-Target = usr/lib/modules/*/pkgbase
+PRESETS=('default' 'fallback')
 
-[Action]
-Description = Updating linux EFI image
-When = PostTransaction
-Exec = /usr/local/bin/dracut-install.sh
-Depends = dracut
-NeedsTargets
-HOOK
+default_uki="/efi/EFI/Linux/arch-linux.efi"
+default_options="--splash /usr/share/systemd/bootctl/splash-arch.bmp"
 
-# Dracut remove hook
-cat > /etc/pacman.d/hooks/60-dracut-remove.hook <<'HOOK'
-[Trigger]
-Type = Path
-Operation = Remove
-Target = usr/lib/modules/*/pkgbase
+fallback_uki="/efi/EFI/Linux/arch-linux-fallback.efi"
+fallback_options="-S autodetect"
+PRESET
 
-[Action]
-Description = Removing linux EFI image
-When = PreTransaction
-Exec = /usr/local/bin/dracut-remove.sh
-NeedsTargets
-HOOK
+# Regenerate initramfs
+mkinitcpio -P
 
-# ====================================
-# SecureBoot Setup
-# ====================================
+# Configure systemd-boot
+cat > /efi/loader/loader.conf <<LOADER
+default arch-linux.efi
+timeout 3
+console-mode max
+editor no
+LOADER
 
-# Create SecureBoot keys BEFORE generating UKI
-echo "Creating SecureBoot keys..."
+# Setup Secure Boot
+echo ""
+echo "Setting up Secure Boot..."
+echo "Creating and enrolling Secure Boot keys..."
+
+# Create Secure Boot keys
 sbctl create-keys
 
-# Dracut kernel cmdline
-cat > /etc/dracut.conf.d/cmdline.conf <<CMDLINE
-kernel_cmdline="rd.luks.uuid=luks-$LUKS_UUID root=/dev/mapper/cryptroot rootfstype=btrfs rootflags=subvol=@,rw,noatime,compress=zstd:1"
-CMDLINE
+# Enroll keys (with Microsoft keys for compatibility)
+sbctl enroll-keys -m
 
-# Dracut flags
-cat > /etc/dracut.conf.d/flags.conf <<FLAGS
-compress="zstd"
-hostonly="no"
-add_dracutmodules+=" crypt btrfs "
-FLAGS
+# Sign bootloader and kernel
+sbctl sign -s /efi/EFI/BOOT/BOOTX64.EFI
+sbctl sign -s /efi/EFI/systemd/systemd-bootx64.efi
+sbctl sign -s /efi/EFI/Linux/arch-linux.efi
+sbctl sign -s /efi/EFI/Linux/arch-linux-fallback.efi
 
-# SecureBoot configuration for dracut (NOW keys exist)
-cat > /etc/dracut.conf.d/secureboot.conf <<SECUREBOOT
-uefi_secureboot_cert="/var/lib/sbctl/keys/db/db.pem"
-uefi_secureboot_key="/var/lib/sbctl/keys/db/db.key"
-SECUREBOOT
+# Verify signing
+echo ""
+echo "Verifying Secure Boot signatures..."
+sbctl verify
 
-# Generate UKI (will auto-sign with dracut)
-echo "Generating Unified Kernel Image..."
-pacman -S --noconfirm linux
-
-# Verify UKI was created and sign with sbctl too
-if [[ -f /boot/efi/EFI/Linux/bootx64.efi ]]; then
-    echo "UKI created successfully, signing with sbctl..."
-    sbctl sign -s /boot/efi/EFI/Linux/bootx64.efi
-else
-    echo "ERROR: UKI was not created!"
-    exit 1
-fi
-
-# Override sbctl pacman hook
-cat > /etc/pacman.d/hooks/zz-sbctl.hook <<SBCTL
-[Trigger]
-Type = Path
-Operation = Install
-Operation = Upgrade
-Operation = Remove
-Target = boot/*
-Target = efi/*
-Target = usr/lib/modules/*/vmlinuz
-Target = usr/lib/initcpio/*
-Target = usr/lib/**/efi/*.efi*
-
-[Action]
-Description = Signing EFI binaries...
-When = PostTransaction
-Exec = /usr/bin/sbctl sign /boot/efi/EFI/Linux/bootx64.efi
-SBCTL
-
-# Enroll keys (with Microsoft keys for dual-boot compatibility)
-echo "Enrolling SecureBoot keys..."
-sbctl enroll-keys --microsoft
-
-# ====================================
-# UEFI Boot Entry
-# ====================================
-
-# Create UEFI boot entry
-efibootmgr --create --disk $DISK --part 1 --label "Arch Linux" --loader 'EFI\Linux\bootx64.efi' --unicode
-
-# Set boot order (get the number from last entry)
-BOOT_NUM=\$(efibootmgr | grep "Arch Linux" | cut -d' ' -f1 | tr -d 'Boot*')
-efibootmgr -o \$BOOT_NUM
-
-echo "Boot entry created: \$BOOT_NUM"
-
+echo ""
+echo "=========================================="
+echo "Installation complete!"
+echo "=========================================="
+echo ""
+echo "System configured with:"
+echo "- BTRFS filesystem with subvolumes"
+echo "- LUKS2 encryption (AES-XTS-512, Argon2id)"
+echo "- Secure Boot ready (keys enrolled)"
+echo "- User: $USERNAME"
+echo "- Hostname: $HOSTNAME"
+echo ""
+echo "IMPORTANT POST-INSTALL STEPS:"
+echo "1. Reboot and enter BIOS/UEFI settings"
+echo "2. Enable Secure Boot"
+echo "3. Set BIOS supervisor password (recommended)"
+echo "4. Clear any old Secure Boot keys if needed"
+echo ""
 EOF
 
-# 11. Cleanup
+# Unmount and close
+echo ""
 echo "Unmounting filesystems..."
 umount -R /mnt
-cryptsetup close cryptroot
+cryptsetup close $CRYPT_NAME
 
 echo ""
-echo "✅ Installation complete!"
+echo "=========================================="
+echo "Installation finished successfully!"
+echo "=========================================="
 echo ""
-echo "======================================"
 echo "NEXT STEPS:"
-echo "======================================"
-echo "1. Reboot your system"
-echo "2. Enter BIOS/UEFI setup"
-echo "3. Enable 'Setup Mode' for SecureBoot"
-echo "4. Enable SecureBoot"
-echo "5. Set BIOS password"
-echo "6. Boot into Arch Linux"
-echo "7. Enter LUKS password: $LUKS_PASSWORD"
+echo "1. Remove the installation media"
+echo "2. Reboot: reboot"
+echo "3. Enter BIOS and enable Secure Boot"
+echo "4. Boot into your new system"
+echo "5. You'll be prompted for LUKS password"
+echo "6. Check Secure Boot status: sbctl status"
 echo ""
-echo "Verify SecureBoot status with:"
-echo "  sbctl status"
+echo "Security features enabled:"
+echo "✓ LUKS2 with 512-bit AES-XTS encryption"
+echo "✓ Argon2id key derivation (5 second iteration)"
+echo "✓ Secure Boot keys created and enrolled"
+echo "✓ All boot components signed"
+echo "✓ systemd-based encryption hooks"
 echo ""
-echo "LUKS Encryption Details:"
-echo "  Cipher: $LUKS_CIPHER"
-echo "  Key Size: $LUKS_KEY_SIZE-bit"
-echo "  PBKDF: $LUKS_PBKDF"
-echo "  Iteration Time: ${LUKS_ITER_TIME}ms"
-echo "======================================"
